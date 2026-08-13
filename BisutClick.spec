@@ -14,6 +14,9 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
+# 동영상 캡처 기능을 쓰지 않으므로 opencv의 ffmpeg 백엔드 DLL(약 30MB)은 번들에서 제외한다
+a.binaries = [b for b in a.binaries if 'ffmpeg' not in b[0].lower()]
+
 pyz = PYZ(a.pure)
 
 exe = EXE(
