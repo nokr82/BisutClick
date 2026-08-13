@@ -18,6 +18,7 @@
       pyautogui의 안전장치(FAILSAFE)가 동작해 즉시 중단된다.
 """
 
+import ctypes
 import queue
 import threading
 import time
@@ -28,12 +29,66 @@ from tkinter import ttk
 import cv2
 import numpy as np
 import pyautogui
-from PIL import Image, ImageTk
+from PIL import Image, ImageGrab, ImageTk
 from pynput import keyboard, mouse
+
+# 모니터마다 배율(스케일)이 다른 듀얼 모니터 환경에서 좌표가 어긋나는 것을 막기 위해
+# 최대한 이른 시점(윈도우 생성 전)에 프로세스를 모니터별 DPI 인식 상태로 전환한다.
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+except Exception:
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
 
 # pyautogui 안전장치: 마우스를 화면 좌상단 끝으로 보내면 즉시 예외 발생 -> 프로그램 중단
 pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0  # 내부 호출 간 기본 지연은 우리가 직접 제어한다
+
+
+def get_virtual_screen_rect():
+    """모든 모니터를 합친 가상 데스크톱 영역 (x, y, w, h)을 반환한다.
+    보조 모니터가 주 모니터의 왼쪽/위쪽에 있으면 x, y는 음수가 될 수 있다."""
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN = 76, 77
+    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN = 78, 79
+    user32 = ctypes.windll.user32
+    x = user32.GetSystemMetrics(SM_XVIRTUALSCREEN)
+    y = user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
+    w = user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)
+    h = user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)
+    return x, y, w, h
+
+
+def screenshot_virtual(region=None):
+    """모든 모니터를 포함해 캡처한다. region은 (x, y, w, h) 형태의 절대(가상 데스크톱)
+    좌표이며, 반환값은 (이미지, 가상화면 원점 x, 가상화면 원점 y)이다."""
+    img = ImageGrab.grab(all_screens=True)
+    vx, vy, _, _ = get_virtual_screen_rect()
+    if region is not None:
+        x, y, w, h = region
+        img = img.crop((x - vx, y - vy, x - vx + w, y - vy + h))
+    return img, vx, vy
+
+
+def get_monitors():
+    """연결된 모든 모니터의 (x, y, w, h) 목록을 왼쪽->오른쪽, 위->아래 순서로 반환한다."""
+    from ctypes import wintypes
+
+    monitors = []
+
+    def _callback(hMonitor, hdcMonitor, lprcMonitor, dwData):
+        r = lprcMonitor.contents
+        monitors.append((r.left, r.top, r.right - r.left, r.bottom - r.top))
+        return 1
+
+    MonitorEnumProc = ctypes.WINFUNCTYPE(
+        ctypes.c_int, wintypes.HMONITOR, wintypes.HDC,
+        ctypes.POINTER(wintypes.RECT), wintypes.LPARAM,
+    )
+    ctypes.windll.user32.EnumDisplayMonitors(0, 0, MonitorEnumProc(_callback), 0)
+    monitors.sort(key=lambda m: (m[0], m[1]))
+    return monitors
 
 
 @dataclass
@@ -95,6 +150,8 @@ class SimilarImageAutoClicker:
         self.template_gray = None
         self.template_size = None  # (w, h)
 
+        self.target_region = None  # None이면 전체(모든 모니터), 아니면 (x, y, w, h)로 스캔 범위를 제한
+
         self.matches = []
         self.lock = threading.Lock()
 
@@ -120,7 +177,12 @@ class SimilarImageAutoClicker:
         if template is None:
             return
 
-        shot = pyautogui.screenshot()
+        region = self.target_region
+        if region is not None:
+            shot, _, _ = screenshot_virtual(region=region)
+            ox, oy = region[0], region[1]
+        else:
+            shot, ox, oy = screenshot_virtual()  # 모든 모니터를 포함해 캡처
         screen = cv2.cvtColor(np.array(shot), cv2.COLOR_RGB2GRAY)
 
         tw, th = size
@@ -131,7 +193,8 @@ class SimilarImageAutoClicker:
         ys, xs = np.where(result >= self.threshold)
         candidates = []
         for x, y in zip(xs, ys):
-            candidates.append(Match(int(x), int(y), tw, th, float(result[y, x])))
+            # 캡처 이미지 좌표 -> 실제 화면(가상 데스크톱) 좌표로 변환
+            candidates.append(Match(int(x) + ox, int(y) + oy, tw, th, float(result[y, x])))
 
         candidates = non_max_suppression(candidates)
         candidates = sorted(candidates, key=lambda m: m.score, reverse=True)[: self.max_matches]
@@ -194,6 +257,7 @@ class App(tk.Tk):
 
         self.log_queue = queue.Queue()
         self.template_thumb_img = None  # PhotoImage 참조 유지(GC 방지)
+        self.monitors = get_monitors()  # [(x, y, w, h), ...] 왼쪽->오른쪽 순
 
         self.clicker = SimilarImageAutoClicker(
             on_log=self._enqueue_log,
@@ -248,6 +312,16 @@ class App(tk.Tk):
         self.threshold_label.grid(row=0, column=2)
         opts.columnconfigure(1, weight=1)
 
+        ttk.Label(opts, text="대상 모니터").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        monitor_names = ["전체 화면 (모든 모니터)"] + [
+            f"{i + 1}번 모니터 ({w}x{h})" for i, (_x, _y, w, h) in enumerate(self.monitors)
+        ]
+        self.monitor_var = tk.StringVar(value=monitor_names[0])
+        self.monitor_combo = ttk.Combobox(opts, textvariable=self.monitor_var, values=monitor_names,
+                                           state="readonly")
+        self.monitor_combo.grid(row=1, column=1, columnspan=2, sticky="ew", padx=5, pady=(6, 0))
+        self.monitor_combo.bind("<<ComboboxSelected>>", self._on_monitor_change)
+
         status_frame = ttk.Frame(self, padding=(10, 4))
         status_frame.pack(fill=tk.X)
         self.status_var = tk.StringVar(value="대기 중 - 템플릿을 먼저 선택하세요")
@@ -271,6 +345,22 @@ class App(tk.Tk):
         self.clicker.threshold = v
         self.threshold_label.config(text=f"{v:.2f}")
 
+    def _on_monitor_change(self, event=None):
+        idx = self.monitor_combo.current()  # 0 = 전체 화면, 1부터 각 모니터
+        if idx <= 0:
+            self.clicker.target_region = None
+            self._log("[모니터] 전체 화면(모든 모니터) 대상으로 스캔합니다")
+        else:
+            region = self.monitors[idx - 1]
+            self.clicker.target_region = region
+            self._log(f"[모니터] {idx}번 모니터만 대상으로 스캔합니다 {region}")
+
+    def _selected_monitor_rect(self):
+        """현재 선택된 모니터의 (x, y, w, h)를 반환. 전체 선택 시 가상 데스크톱 전체."""
+        if self.clicker.target_region is not None:
+            return self.clicker.target_region
+        return get_virtual_screen_rect()
+
     # ---------- 템플릿 캡처 ----------
     def start_capture(self):
         self._log("[선택 모드] 템플릿으로 사용할 영역을 드래그하세요 (ESC 취소)")
@@ -285,7 +375,7 @@ class App(tk.Tk):
             return
 
         x, y, w, h = region
-        shot = pyautogui.screenshot(region=(x, y, w, h))
+        shot, _, _ = screenshot_virtual(region=(x, y, w, h))
         arr_gray = cv2.cvtColor(np.array(shot), cv2.COLOR_RGB2GRAY)
         self.clicker.set_template(arr_gray, w, h)
         self._update_thumbnail(shot)
@@ -294,8 +384,16 @@ class App(tk.Tk):
         self.status_var.set("실행 중 - 화면을 클릭하면 유사 이미지도 함께 클릭됩니다")
 
     def _select_region(self):
+        # "-fullscreen"은 창이 열린 모니터 하나만 덮으므로, 지오메트리를 직접 지정한다.
+        # 특정 모니터가 선택되어 있으면 그 모니터만, 아니면 가상 데스크톱 전체를 덮는다.
+        vx, vy, vw, vh = self._selected_monitor_rect()
+
+        def _fmt(v):
+            return f"+{v}" if v >= 0 else str(v)
+
         top = tk.Toplevel(self)
-        top.attributes("-fullscreen", True)
+        top.overrideredirect(True)
+        top.geometry(f"{vw}x{vh}{_fmt(vx)}{_fmt(vy)}")
         top.attributes("-alpha", 0.25)
         top.attributes("-topmost", True)
         top.configure(bg="gray")
@@ -305,10 +403,11 @@ class App(tk.Tk):
         canvas.pack(fill=tk.BOTH, expand=True)
 
         result = {"region": None}
-        state = {"start": None, "rect": None}
+        state = {"start": None, "start_root": None, "rect": None}
 
         def on_press(event):
-            state["start"] = (event.x_root, event.y_root)
+            state["start"] = (event.x, event.y)
+            state["start_root"] = (event.x_root, event.y_root)
             state["rect"] = canvas.create_rectangle(
                 event.x, event.y, event.x, event.y, outline="red", width=2
             )
@@ -317,10 +416,12 @@ class App(tk.Tk):
             if state["rect"] is None:
                 return
             sx, sy = state["start"]
-            canvas.coords(state["rect"], sx, sy, event.x_root, event.y_root)
+            # 사각형 미리보기는 캔버스 로컬 좌표를 써야 창이 화면 원점(0,0)이 아닌
+            # 보조 모니터 위치에 있어도 올바르게 그려진다.
+            canvas.coords(state["rect"], sx, sy, event.x, event.y)
 
         def on_release(event):
-            sx, sy = state["start"]
+            sx, sy = state["start_root"]
             ex, ey = event.x_root, event.y_root
             x1, x2 = sorted((sx, ex))
             y1, y2 = sorted((sy, ey))
